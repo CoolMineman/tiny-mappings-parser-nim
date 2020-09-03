@@ -116,9 +116,9 @@ func makeHeader(major: int32, minor: int32, parts: seq[string], props: OrderedTa
 
 func countIndent(st: string): int32 =
     let len = st.len
-    var ret = 0
-    while ret < len and st[ret] == indent:
-        ret += 1
+    result = 0
+    while result < len and st[result] == indent:
+        result += 1
 
 proc readMetadata*(reader: Stream): TinyHeader =
     let firstline = reader.readLine()
@@ -154,12 +154,112 @@ proc readMetadata*(reader: Stream): TinyHeader =
         mark = reader.getPosition()
     return makeHeader(majorVersion, minorVersion, parts, properties)
 
+type
+    TinyState = enum
+        class, field, methodd, parameter, local_variable, comment
+
+func getTinyState(indent: int32, identifier: string): TinyState =
+    case identifier:
+    of "c":
+        if indent == 0:
+            return class
+        else:
+            return comment
+    of "m":
+        return methodd
+    of "f":
+        return field
+    of "p":
+        return parameter
+    of "V":
+        return local_variable
+    else:
+        debugEcho "Invalid identifier \"" & identifier & "\"!"
+
+func getActualParts(self: TinyState): int32 =
+    case self:
+    of class:
+        return 1
+    of field, methodd, parameter, comment:
+        return 2
+    of local_variable:
+        return 4
+
+func checkPartCount(self: TinyState, indent: int32, partCount: int32, namespaceCount: int32): bool =
+    case self:
+    of class, field, methodd, parameter, local_variable:
+        return partCount - indent == namespaceCount + self.getActualParts()
+    of comment:
+        return partCount - indent == 2
+
+func checkStack(self: TinyState, stack: openArray[TinyState], currentIndent: int32): bool =
+    case self:
+    of class:
+        return currentIndent == 0
+    of field, methodd:
+        return currentIndent == 1 and stack[currentIndent - 1] == class
+    of parameter, local_variable:
+        return currentIndent == 2 and stack[currentIndent - 1] == methodd
+    of comment:
+        if currentIndent == 0:
+            return false
+        else:
+            case stack[currentIndent - 1]:
+            of class, methodd, field, parameter, local_variable:
+                return true
+            else:
+                return false
+
+func makeGetter(self: TinyState, parts: seq[string], indent: int32, escapedStrings: bool): PartGetter =
+    return PartGetter(offset: indent + self.getActualParts(),
+                      parts: parts,
+                      escapedStrings: escapedStrings)
+
+proc visit(self: TinyState, visitor: ITinyVisitor, parts: seq[string], indent: int32, escapedStrings: bool) =
+    case self:
+    of class:
+        visitor.pushClass(self.makeGetter(parts, indent, escapedStrings))
+    of field:
+        visitor.pushField(self.makeGetter(parts, indent, escapedStrings), unescapeOpt(parts[indent + 1], escapedStrings))
+    of methodd:
+        visitor.pushMethod(self.makeGetter(parts, indent, escapedStrings), unescapeOpt(parts[indent + 1], escapedStrings))
+    of parameter:
+        var big: BiggestInt
+        assert parseBiggestInt(parts[indent + 1], big) > 0
+        visitor.pushParameter(self.makeGetter(parts, indent, escapedStrings), int32(big))
+    of local_variable:
+        var big1: BiggestInt
+        assert parseBiggestInt(parts[indent + 1], big1) > 0
+        var big2: BiggestInt
+        assert parseBiggestInt(parts[indent + 1], big2) > 0
+        var big3: BiggestInt
+        assert parseBiggestInt(parts[indent + 1], big3) > 0
+        visitor.pushLocalVariable(self.makeGetter(parts, indent, escapedStrings), int32(big1), int32(big2), int32(big3))
+    of comment:
+        visitor.pushComment(unescape(parts[indent + 1]))
+
 proc visit*(reader: Stream, visitor: ITinyVisitor) =
-    discard
-
-
-
-# test
-
-var strm = newFileStream("mappings.tiny", fmRead)
-echo readMetadata(strm)
+    let meta = readMetadata(reader)
+    let namespaceCount = int32(meta.getNamespaces().len)
+    let escapedNames = meta.getProperties().hasKey(escaped_names_property)
+    visitor.start(meta)
+    var lastIndent: int32 = -1;
+    var stack = [class, class, class, class] # max depth 4
+    var line: TaintedString
+    while readLine(reader, line):
+        let currentIndent = countIndent(line)
+        if currentIndent > lastIndent + 1:
+            debugEcho "Broken indent! Maximum " & $(lastIndent + 1) & ", actual " & $currentIndent
+        if currentIndent <= lastIndent:
+            visitor.pop(lastIndent - currentIndent + 1)
+        lastIndent = currentIndent
+        let parts = line.split(space_string, -1)
+        let currentState = getTinyState(currentIndent, parts[currentIndent])
+        if not currentState.checkPartCount(currentIndent, int32(parts.len), namespaceCount):
+            debugEcho "Wrong number of parts for definition of a " & $currentState & "!"
+        if not currentState.checkStack(stack, currentIndent):
+            debugEcho "Invalid stack " & $stack & " for a " & $currentState & " at position " & $currentIndent & "!"
+        stack[currentIndent] = currentState
+        currentState.visit(visitor, parts, currentIndent, escapedNames)
+    if lastIndent > -1:
+        visitor.pop(lastIndent + 1)
